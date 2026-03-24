@@ -1,8 +1,12 @@
 # RF-DETR Fine-tuning Repo (Torch)
 
-`2046x2046` 원본 이미지를 `2048x2048`로 리사이즈 후 `8x8` 타일링(`256x256`)하여, 결함이 있는 타일만 남겨 RF-DETR을 학습하기 위한 레포 구성입니다.
+This repo trains RF-DETR for defect detection from your dataset:
+- Original image size: `2046x2046`
+- Resize to: `2048x2048`
+- Tile strategy: `8x8` (`256x256`)
+- Keep only defect tiles by default (tiles with at least one box)
 
-## 1) 디렉토리 구조
+## 1) Project Layout
 
 ```text
 2603 Tester Model/
@@ -17,9 +21,9 @@
 └─ README.md
 ```
 
-## 2) 환경 구성 (RTX3090 권장)
+## 2) Environment (RTX3090)
 
-Python 3.10+ 권장.
+Python 3.10+ recommended.
 
 ```bash
 python -m venv .venv
@@ -29,9 +33,9 @@ pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
 pip install -r requirements.txt
 ```
 
-## 3) 데이터 전처리 (타일링 + 결함 타일만 추출 + train/valid/test 분할)
+## 3) Preprocess Dataset (tiling + split)
 
-프로젝트 루트(`2603 Tester Model`)에서 실행:
+Run from project root (`2603 Tester Model`):
 
 ```bash
 python scripts/prepare_tiled_coco_dataset.py ^
@@ -46,14 +50,7 @@ python scripts/prepare_tiled_coco_dataset.py ^
   --overwrite
 ```
 
-기본 동작:
-- YOLO 라벨(`class x_center y_center width height`)을 읽어 COCO bbox로 변환
-- 타일별 박스 클리핑
-- 박스가 없는 타일은 기본적으로 제거 (결함 타일만 유지)
-- 원본 이미지 단위로 split 적용 (같은 원본의 타일이 다른 split으로 섞이지 않음)
-- 라벨 없는 이미지는 자동 스킵하며 `metadata/missing_labels.txt`로 기록
-
-전처리 결과:
+Output:
 
 ```text
 data/rfdetr_tiled_coco/
@@ -73,7 +70,7 @@ data/rfdetr_tiled_coco/
    └─ tile_manifest.csv
 ```
 
-## 4) RF-DETR 학습
+## 4) Train RF-DETR (Epoch Metrics + Albumentations)
 
 ```bash
 python scripts/train_rfdetr.py ^
@@ -83,44 +80,69 @@ python scripts/train_rfdetr.py ^
   --epochs 100 ^
   --batch-size 8 ^
   --grad-accum-steps 2 ^
-  --lr 1e-4
+  --num-workers 8 ^
+  --lr 1e-4 ^
+  --tensorboard
 ```
 
-RTX3090 권장 시작점:
-- `model-size=medium`
-- `batch-size=8`
-- `grad-accum-steps=2` (effective batch 16)
+### Added features in this trainer
 
-OOM 발생 시:
-1. `--batch-size 4`로 감소
-2. `--model-size small` 사용
+1. Epoch-wise performance is printed in console:
+- `val/mAP_50_95`
+- `val/mAP_50`
+- `val/F1`
+- `val/precision`
+- `val/recall`
+- loss metrics when available
 
-## 5) 단일 이미지 추론 테스트
+2. Albumentations policy is enabled by default:
+- `HorizontalFlip(p=0.2)`
+- color branch with OR behavior:
+  - `RGBShift` (~0.2)
+  - `HueSaturationValue` (~0.2)
+  - `ChannelShuffle` (~0.2)
+
+Implementation note:
+- The OR branch is implemented with `OneOf` + `NoOp`.
+- Weights are set to `0.2, 0.2, 0.2, 0.4` for `RGBShift`, `HueSaturationValue`, `ChannelShuffle`, `NoOp`.
+- This matches your requested probabilities while keeping OR behavior.
+
+3. Different augmentation randomness every epoch:
+- Trainer includes an epoch callback that applies a different random seed each epoch.
+- Seed log example: `[AugmentSeed] epoch=003 seed=44`
+
+### Useful flags
+
+- Disable augmentations:
+```bash
+python scripts/train_rfdetr.py --disable-augment ...
+```
+
+- Resume from `output_dir/checkpoint.pth`:
+```bash
+python scripts/train_rfdetr.py --resume ...
+```
+
+- Force high-level API fallback:
+```bash
+python scripts/train_rfdetr.py --force-high-level-api ...
+```
+
+## 5) Single-image Inference Test
 
 ```bash
 python scripts/predict_tile.py ^
   --image-path ./data/rfdetr_tiled_coco/test/some_tile.jpg ^
   --model-size medium ^
-  --checkpoint ./runs/rfdetr-medium/best.pth ^
+  --checkpoint ./runs/rfdetr-medium/checkpoint_best_total.pth ^
   --threshold 0.3
 ```
 
-## 6) 클래스 이름 커스터마이징 (선택)
+## 6) Optional: Custom Class Names
 
-기본 클래스명은 `class_0 ... class_7`로 생성됩니다.  
-원하면 한 줄에 하나씩 클래스명을 적은 txt 파일을 만들고:
+Default names are generated from YOLO ids (`class_0`, `class_1`, ...).  
+To override, create a text file with one class name per line:
 
 ```bash
 python scripts/prepare_tiled_coco_dataset.py --class-names-file ./class_names.txt ...
 ```
-
-`class_names.txt` 예시:
-
-```text
-blackspot
-air
-gas
-pockmark
-...
-```
-
