@@ -59,7 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume training from output_dir/checkpoint.pth if present.",
+        help="Resume training from the latest checkpoint in output_dir.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Resume from a specific checkpoint path (.ckpt/.pth).",
     )
     parser.add_argument(
         "--pretrain-weights",
@@ -175,14 +181,37 @@ def build_requested_aug_config() -> Dict[str, Any]:
     }
 
 
-def resolve_resume_path(output_dir: Path, do_resume: bool) -> str | None:
+def resolve_resume_path(
+    output_dir: Path,
+    do_resume: bool,
+    resume_from: Path | None = None,
+) -> str | None:
+    if resume_from is not None:
+        resolved = resume_from.resolve()
+        if not resolved.exists():
+            raise FileNotFoundError(f"--resume-from file not found: {resolved}")
+        print(f"Resume checkpoint selected (--resume-from): {resolved}")
+        return str(resolved)
+
     if not do_resume:
         return None
-    checkpoint_path = output_dir / "checkpoint.pth"
-    if checkpoint_path.exists():
-        return str(checkpoint_path.resolve())
+
+    candidates = sorted(
+        [
+            p
+            for p in output_dir.glob("*")
+            if p.is_file() and p.suffix.lower() in {".ckpt", ".pth"} and p.name.startswith("checkpoint")
+        ],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if candidates:
+        chosen = candidates[0].resolve()
+        print(f"Resume checkpoint selected (--resume): {chosen}")
+        return str(chosen)
+
     print(
-        f"Warning: --resume was set but checkpoint not found: {checkpoint_path}. "
+        f"Warning: --resume was set but no checkpoint file was found in {output_dir}. "
         "Starting from scratch."
     )
     return None
@@ -241,7 +270,7 @@ def run_high_level_train(
         "tensorboard": args.tensorboard,
         "aug_config": {} if args.disable_augment else aug_config,
     }
-    resume_path = resolve_resume_path(output_dir, args.resume)
+    resume_path = resolve_resume_path(output_dir, args.resume, args.resume_from)
     if resume_path:
         requested_train_kwargs["resume"] = resume_path
 
@@ -273,7 +302,18 @@ def run_high_level_train(
         "Note: per-epoch metrics are produced by RF-DETR COCOEvalCallback "
         "(val/mAP_50_95, val/F1, etc.) when eval_interval=1."
     )
-    model.train(**train_kwargs)
+    try:
+        model.train(**train_kwargs)
+    except ModuleNotFoundError as exc:
+        if exc.name == "pytorch_lightning":
+            raise ModuleNotFoundError(
+                "Missing dependency: pytorch_lightning\n"
+                "Please install and retry:\n"
+                "  python -m pip install pytorch-lightning\n"
+                "or reinstall all deps:\n"
+                "  python -m pip install -r requirements.txt"
+            ) from exc
+        raise
 
 
 def main() -> None:
@@ -307,6 +347,18 @@ def main() -> None:
         raise ImportError(
             "rfdetr package is not installed. Install dependencies first:\n"
             "  pip install -r requirements.txt"
+        ) from exc
+
+    # rfdetr training path requires pytorch_lightning internally.
+    try:
+        import pytorch_lightning  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Missing dependency: pytorch_lightning\n"
+            "Please install and retry:\n"
+            "  python -m pip install pytorch-lightning\n"
+            "or reinstall all deps:\n"
+            "  python -m pip install -r requirements.txt"
         ) from exc
 
     if args.force_high_level_api:
@@ -374,6 +426,8 @@ def main() -> None:
         }
     model_config = model_config_cls(**model_config_kwargs)
 
+    resume_for_config = resolve_resume_path(output_dir, args.resume, args.resume_from)
+
     train_config_kwargs = {
         "dataset_dir": str(dataset_dir),
         "output_dir": str(output_dir),
@@ -389,7 +443,7 @@ def main() -> None:
         "seed": args.seed,
         "class_names": class_names,
         "aug_config": {} if args.disable_augment else aug_config,
-        "resume": resolve_resume_path(output_dir, args.resume),
+        "resume": resume_for_config,
     }
     train_config_sig = inspect.signature(TrainConfig.__init__)
     train_config_has_var_kwargs = any(

@@ -6,3 +6,6 @@ numpy>=1.24.0
 albumentations>=1.4.24
 rfdetr>=1.6.0
 tensorboard>=2.16.0
+pytorch-lightning>=2.2.0,<3.0.0
+pycocotools
+faster-coco-eval
