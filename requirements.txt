@@ -9,3 +9,4 @@ tensorboard>=2.16.0
 pytorch-lightning>=2.2.0,<3.0.0
 pycocotools
 faster-coco-eval
+PyYAML>=6.0

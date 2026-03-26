@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import inspect
 import json
 import random
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -99,6 +101,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force model.train(...) path instead of PTL custom API.",
     )
+    parser.add_argument(
+        "--include-classes",
+        nargs="+",
+        default=None,
+        help=(
+            "Class names to train on. "
+            "Supports space-separated or comma-separated values."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-classes",
+        nargs="+",
+        default=None,
+        help=(
+            "Class names to exclude from training. "
+            "Supports space-separated or comma-separated values."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -140,6 +160,166 @@ def load_coco_category_info(dataset_dir: Path) -> tuple[int, List[str]]:
     sorted_cats = sorted(categories, key=lambda c: int(c["id"]))
     class_names = [str(cat["name"]) for cat in sorted_cats]
     return len(sorted_cats), class_names
+
+
+def parse_class_tokens(raw_values: List[str] | None) -> List[str]:
+    if not raw_values:
+        return []
+    out: List[str] = []
+    seen = set()
+    for raw in raw_values:
+        for token in str(raw).split(","):
+            name = token.strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def resolve_selected_class_names(
+    all_class_names: List[str],
+    include_tokens: List[str],
+    exclude_tokens: List[str],
+) -> List[str]:
+    lowered_to_name = {name.lower(): name for name in all_class_names}
+
+    missing_include = [n for n in include_tokens if n.lower() not in lowered_to_name]
+    if missing_include:
+        raise ValueError(
+            "Unknown class name(s) in --include-classes: " + ", ".join(missing_include)
+        )
+    missing_exclude = [n for n in exclude_tokens if n.lower() not in lowered_to_name]
+    if missing_exclude:
+        print(
+            "Warning: class name(s) in --exclude-classes were not found and will be ignored: "
+            + ", ".join(missing_exclude)
+        )
+
+    if include_tokens:
+        selected = [lowered_to_name[n.lower()] for n in include_tokens]
+    else:
+        selected = list(all_class_names)
+
+    exclude_set = {n.lower() for n in exclude_tokens}
+    selected = [n for n in selected if n.lower() not in exclude_set]
+    if not selected:
+        raise ValueError("No classes left after include/exclude filtering.")
+    return selected
+
+
+def build_filtered_dataset(
+    source_dataset_dir: Path,
+    filtered_dataset_dir: Path,
+    selected_class_names: List[str],
+) -> Path:
+    if filtered_dataset_dir.exists():
+        shutil.rmtree(filtered_dataset_dir)
+    filtered_dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    selected_set = set(selected_class_names)
+    global_name_to_new_id = {name: idx + 1 for idx, name in enumerate(selected_class_names)}
+    global_categories = [
+        {"id": idx + 1, "name": name, "supercategory": "defect"}
+        for idx, name in enumerate(selected_class_names)
+    ]
+
+    for split in ("train", "valid", "test"):
+        src_ann = source_dataset_dir / split / "_annotations.coco.json"
+        if not src_ann.exists():
+            continue
+        payload = json.loads(src_ann.read_text(encoding="utf-8"))
+
+        old_id_to_name = {
+            int(cat["id"]): str(cat["name"])
+            for cat in payload.get("categories", [])
+        }
+        old_id_to_new_id = {
+            old_id: global_name_to_new_id[name]
+            for old_id, name in old_id_to_name.items()
+            if name in selected_set
+        }
+
+        dst_split_dir = filtered_dataset_dir / split
+        dst_split_dir.mkdir(parents=True, exist_ok=True)
+        src_split_dir = (source_dataset_dir / split).resolve()
+
+        filtered_images = []
+        for img in payload.get("images", []):
+            new_img = copy.deepcopy(img)
+            file_name = str(new_img.get("file_name", ""))
+            if not file_name:
+                continue
+            abs_image_path = (src_split_dir / file_name).resolve()
+            new_img["file_name"] = str(abs_image_path)
+            filtered_images.append(new_img)
+
+        filtered_annotations = []
+        for ann in payload.get("annotations", []):
+            old_cat_id = int(ann.get("category_id", -1))
+            if old_cat_id not in old_id_to_new_id:
+                continue
+            new_ann = copy.deepcopy(ann)
+            new_ann["category_id"] = old_id_to_new_id[old_cat_id]
+            filtered_annotations.append(new_ann)
+
+        filtered_payload = copy.deepcopy(payload)
+        filtered_payload["images"] = filtered_images
+        filtered_payload["annotations"] = filtered_annotations
+        filtered_payload["categories"] = global_categories
+
+        dst_ann = dst_split_dir / "_annotations.coco.json"
+        dst_ann.write_text(
+            json.dumps(filtered_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    return filtered_dataset_dir
+
+
+def prepare_dataset_for_class_selection(
+    args: argparse.Namespace,
+    dataset_dir: Path,
+    output_dir: Path,
+) -> tuple[Path, List[str]]:
+    class_count, all_class_names = load_coco_category_info(dataset_dir)
+    _ = class_count
+
+    include_tokens = parse_class_tokens(args.include_classes)
+    exclude_tokens = parse_class_tokens(args.exclude_classes)
+    selected_class_names = resolve_selected_class_names(
+        all_class_names=all_class_names,
+        include_tokens=include_tokens,
+        exclude_tokens=exclude_tokens,
+    )
+
+    if selected_class_names == all_class_names:
+        return dataset_dir, selected_class_names
+
+    filtered_dataset_dir = output_dir / "_filtered_dataset"
+    build_filtered_dataset(
+        source_dataset_dir=dataset_dir,
+        filtered_dataset_dir=filtered_dataset_dir,
+        selected_class_names=selected_class_names,
+    )
+
+    selection_meta = {
+        "source_dataset_dir": str(dataset_dir),
+        "filtered_dataset_dir": str(filtered_dataset_dir),
+        "all_class_names": all_class_names,
+        "selected_class_names": selected_class_names,
+        "include_classes": include_tokens,
+        "exclude_classes": exclude_tokens,
+    }
+    (output_dir / "class_selection.json").write_text(
+        json.dumps(selection_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"Class-filtered dataset created: {filtered_dataset_dir}")
+    return filtered_dataset_dir, selected_class_names
 
 
 def build_requested_aug_config() -> Dict[str, Any]:
@@ -318,12 +498,17 @@ def run_high_level_train(
 
 def main() -> None:
     args = parse_args()
-    dataset_dir = args.dataset_dir.resolve()
+    source_dataset_dir = args.dataset_dir.resolve()
     output_dir = args.output_dir.resolve()
-    ensure_dataset_layout(dataset_dir)
+    ensure_dataset_layout(source_dataset_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    class_count, class_names = load_coco_category_info(dataset_dir)
+    dataset_dir, class_names = prepare_dataset_for_class_selection(
+        args=args,
+        dataset_dir=source_dataset_dir,
+        output_dir=output_dir,
+    )
+    class_count = len(class_names)
     aug_config = build_requested_aug_config()
     if args.disable_augment:
         print("Augmentation is disabled by --disable-augment")
@@ -340,6 +525,7 @@ def main() -> None:
     print(summarize_split(dataset_dir, "valid"))
     print(summarize_split(dataset_dir, "test"))
     print(f"Detected class count: {class_count}")
+    print(f"Selected classes: {class_names}")
 
     try:
         import rfdetr
@@ -536,6 +722,7 @@ def main() -> None:
     )
 
     print("Starting RF-DETR training (custom PTL API) with arguments:")
+    print(f"  source_dataset_dir: {source_dataset_dir}")
     print(f"  dataset_dir: {dataset_dir}")
     print(f"  output_dir: {output_dir}")
     print(f"  model_size: {args.model_size}")
