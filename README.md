@@ -149,7 +149,52 @@ python scripts/check_coco_images.py --dataset-dir ./data/rfdetr_tiled_coco --cle
 Prediction visualization uses zero-based class index mapping (RF-DETR `predict()` output convention).
 No class-index-base option is needed.
 
-## 7) Class count notebook
+## 7) Split Visualization (Best Model)
+
+`checkpoint_best_total.pth` 기준으로 `train/valid/test` split을 각각 시각화:
+
+```bash
+# train split
+python scripts/visualize_coco_bboxes.py ^
+  --dataset-dir ./data/rfdetr_tiled_coco ^
+  --split train ^
+  --mode both ^
+  --run-dir ./runs/rfdetr-medium-7cls ^
+  --checkpoint ./runs/rfdetr-medium-7cls/checkpoint_best_total.pth ^
+  --model-size medium ^
+  --threshold 0.3 ^
+  --max-images 0 ^
+  --skip-empty ^
+  --output-dir ./runs/vis/train_both_best
+
+# valid split
+python scripts/visualize_coco_bboxes.py ^
+  --dataset-dir ./data/rfdetr_tiled_coco ^
+  --split valid ^
+  --mode both ^
+  --run-dir ./runs/rfdetr-medium-7cls ^
+  --checkpoint ./runs/rfdetr-medium-7cls/checkpoint_best_total.pth ^
+  --model-size medium ^
+  --threshold 0.3 ^
+  --max-images 0 ^
+  --skip-empty ^
+  --output-dir ./runs/vis/valid_both_best
+
+# test split
+python scripts/visualize_coco_bboxes.py ^
+  --dataset-dir ./data/rfdetr_tiled_coco ^
+  --split test ^
+  --mode both ^
+  --run-dir ./runs/rfdetr-medium-7cls ^
+  --checkpoint ./runs/rfdetr-medium-7cls/checkpoint_best_total.pth ^
+  --model-size medium ^
+  --threshold 0.3 ^
+  --max-images 0 ^
+  --skip-empty ^
+  --output-dir ./runs/vis/test_both_best
+```
+
+## 8) Class count notebook
 
 Use `data_preprocess.ipynb` to inspect:
 - source YOLO class bbox counts
