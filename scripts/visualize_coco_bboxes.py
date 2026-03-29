@@ -179,6 +179,32 @@ def load_predictor(args: argparse.Namespace):
     return model
 
 
+def load_run_class_names(run_dir: Path, checkpoint_path: Path) -> List[str] | None:
+    meta_path = run_dir / "class_selection.json"
+    if meta_path.exists():
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            selected = payload.get("selected_class_names", [])
+            if isinstance(selected, list) and selected:
+                return [str(x) for x in selected]
+        except Exception:
+            pass
+
+    try:
+        import torch
+
+        ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+        args_obj = ckpt.get("args", ckpt.get("hyper_parameters", {}))
+        if isinstance(args_obj, dict):
+            names = args_obj.get("class_names", None)
+            if isinstance(names, list) and names:
+                return [str(x) for x in names]
+    except Exception:
+        pass
+
+    return None
+
+
 def extract_predictions(detections: Any) -> List[Tuple[int, float, float, float, float, float]]:
     rows: List[Tuple[int, float, float, float, float, float]] = []
     if detections is None:
@@ -211,13 +237,15 @@ def extract_predictions(detections: Any) -> List[Tuple[int, float, float, float,
     return rows
 
 
-def map_pred_class_name(pred_class_id: int, id_to_name: Dict[int, str]) -> str:
-    # Handle both 0-based and 1-based prediction class ids.
-    if pred_class_id in id_to_name:
-        return id_to_name[pred_class_id]
-    if (pred_class_id + 1) in id_to_name:
-        return id_to_name[pred_class_id + 1]
-    return f"class_{pred_class_id}"
+def map_pred_class_name(
+    pred_class_id: int,
+    class_names: List[str],
+) -> Tuple[str, int | None]:
+    # RF-DETR predict() class_id is treated as 0-based index.
+    idx = pred_class_id
+    if 0 <= idx < len(class_names):
+        return class_names[idx], idx
+    return f"class_{pred_class_id}", None
 
 
 def main() -> None:
@@ -246,6 +274,9 @@ def main() -> None:
     categories = payload.get("categories", [])
 
     id_to_name: Dict[int, str] = {int(c["id"]): str(c["name"]) for c in categories}
+    ordered_dataset_class_names = [
+        str(c["name"]) for c in sorted(categories, key=lambda c: int(c["id"]))
+    ]
     ann_by_image: Dict[int, List[Dict]] = defaultdict(list)
     for ann in annotations:
         ann_by_image[int(ann["image_id"])].append(ann)
@@ -256,6 +287,16 @@ def main() -> None:
         font = None
 
     predictor = load_predictor(args) if mode_pred else None
+    pred_class_names = ordered_dataset_class_names
+    checkpoint_path = None
+    if mode_pred:
+        checkpoint_path = resolve_model_checkpoint(args)
+        run_class_names = load_run_class_names(args.run_dir.resolve(), checkpoint_path)
+        if run_class_names:
+            pred_class_names = run_class_names
+            print(f"Using class order from run/checkpoint: {pred_class_names}")
+        else:
+            print(f"Using class order from dataset categories: {pred_class_names}")
 
     max_images = args.max_images
     limit = len(images) if max_images <= 0 else min(len(images), max_images)
@@ -307,14 +348,19 @@ def main() -> None:
             canvas_pred = base_image.copy()
             draw_pred = ImageDraw.Draw(canvas_pred)
             detections = predictor.predict(base_image, threshold=args.threshold)
-            for cid, conf, x1, y1, x2, y2 in extract_predictions(detections):
-                name = map_pred_class_name(cid, id_to_name)
+            pred_rows = extract_predictions(detections)
+            for cid, conf, x1, y1, x2, y2 in pred_rows:
+                name, class_idx = map_pred_class_name(
+                    pred_class_id=cid,
+                    class_names=pred_class_names,
+                )
                 label = f"{name} {conf:.2f}" if conf >= 0 else name
+                color_id = (class_idx + 1) if class_idx is not None else (cid + 1)
                 draw_box_with_label(
                     draw=draw_pred,
                     box=(x1, y1, x2, y2),
                     label=label,
-                    color=color_for_category(cid + 1),
+                    color=color_for_category(color_id),
                     line_width=args.line_width,
                     font=font,
                 )

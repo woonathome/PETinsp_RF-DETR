@@ -301,7 +301,20 @@ def prepare_dataset_for_class_selection(
         exclude_tokens=exclude_tokens,
     )
 
+    selection_meta = {
+        "source_dataset_dir": str(dataset_dir),
+        "all_class_names": all_class_names,
+        "selected_class_names": selected_class_names,
+        "include_classes": include_tokens,
+        "exclude_classes": exclude_tokens,
+    }
+
     if selected_class_names == all_class_names:
+        selection_meta["filtered_dataset_dir"] = None
+        (output_dir / "class_selection.json").write_text(
+            json.dumps(selection_meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         return dataset_dir, selected_class_names
 
     filtered_dataset_dir = output_dir / "_filtered_dataset"
@@ -311,14 +324,7 @@ def prepare_dataset_for_class_selection(
         selected_class_names=selected_class_names,
     )
 
-    selection_meta = {
-        "source_dataset_dir": str(dataset_dir),
-        "filtered_dataset_dir": str(filtered_dataset_dir),
-        "all_class_names": all_class_names,
-        "selected_class_names": selected_class_names,
-        "include_classes": include_tokens,
-        "exclude_classes": exclude_tokens,
-    }
+    selection_meta["filtered_dataset_dir"] = str(filtered_dataset_dir)
     (output_dir / "class_selection.json").write_text(
         json.dumps(selection_meta, ensure_ascii=False, indent=2),
         encoding="utf-8",

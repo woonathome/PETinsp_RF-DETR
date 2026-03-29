@@ -144,7 +144,12 @@ python scripts/check_coco_images.py --dataset-dir ./data/rfdetr_tiled_coco
 python scripts/check_coco_images.py --dataset-dir ./data/rfdetr_tiled_coco --clean
 ```
 
-## 6) Class count notebook
+## 6) Visualization class-index note
+
+Prediction visualization uses zero-based class index mapping (RF-DETR `predict()` output convention).
+No class-index-base option is needed.
+
+## 7) Class count notebook
 
 Use `data_preprocess.ipynb` to inspect:
 - source YOLO class bbox counts
