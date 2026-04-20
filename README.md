@@ -36,7 +36,7 @@ python scripts/prepare_tiled_coco_dataset.py
   --test-ratio 0.10 
   --split-strategy dominant_class 
   --min-defect-side-px 10 
-  --pockmark-top-percent 0.50 
+  --pockmark-top-percent 0.10 
   --pockmark-border-px 2 
   --seed 42 
   --overwrite
