@@ -33,6 +33,17 @@ PALETTE = [
     (241, 196, 15),
 ]
 
+CLASS_COLOR_BY_NAME = {
+    "airbubble": (245, 235, 0),          # yellow
+    "blackspot": (22, 219, 189),         # mint/teal
+    "color-distribution": (220, 0, 220), # magenta
+    "dust": (255, 128, 0),               # orange
+    "gasbubble": (255, 0, 96),           # pink-red
+    "pockmark": (122, 44, 230),          # purple
+    "scratch": (173, 235, 0),            # lime
+    "unknown": (0, 170, 220),            # sky blue
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -100,6 +111,16 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="Prediction confidence threshold.",
     )
+    parser.add_argument(
+        "--skip-gt-only-classes",
+        nargs="+",
+        default=None,
+        help=(
+            "Skip images when all GT boxes belong to these class names "
+            "(case-insensitive, space/comma separated). "
+            "Example: --skip-gt-only-classes unknown pockmark_unstable"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -110,8 +131,29 @@ def resolve_image_path(split_dir: Path, file_name: str) -> Path:
     return split_dir / p
 
 
+def parse_class_tokens(raw_values: List[str] | None) -> set[str]:
+    if not raw_values:
+        return set()
+    out = set()
+    for raw in raw_values:
+        for token in str(raw).split(","):
+            name = token.strip().lower()
+            if name:
+                out.add(name)
+    return out
+
+
 def color_for_category(category_id: int) -> Tuple[int, int, int]:
     return PALETTE[(int(category_id) - 1) % len(PALETTE)]
+
+
+def color_for_class_name(class_name: str, category_id: int | None = None) -> Tuple[int, int, int]:
+    key = str(class_name).strip().lower()
+    if key in CLASS_COLOR_BY_NAME:
+        return CLASS_COLOR_BY_NAME[key]
+    if category_id is not None:
+        return color_for_category(category_id)
+    return (255, 255, 255)
 
 
 def draw_box_with_label(
@@ -261,6 +303,7 @@ def main() -> None:
 
     mode_gt = args.mode in {"gt", "both"}
     mode_pred = args.mode in {"pred", "both"}
+    skip_gt_only_set = parse_class_tokens(args.skip_gt_only_classes)
     gt_dir = output_dir / "gt" if mode_gt else None
     pred_dir = output_dir / "pred" if mode_pred else None
     if gt_dir is not None:
@@ -304,11 +347,20 @@ def main() -> None:
     saved_gt = 0
     saved_pred = 0
     skipped = 0
+    skipped_gt_only = 0
     for img in images[:limit]:
         image_id = int(img["id"])
         file_name = str(img["file_name"])
         image_path = resolve_image_path(split_dir, file_name)
         anns = ann_by_image.get(image_id, [])
+        if skip_gt_only_set and anns:
+            gt_names = [
+                id_to_name.get(int(ann.get("category_id", -1)), f"class_{ann.get('category_id', -1)}").lower()
+                for ann in anns
+            ]
+            if gt_names and all(name in skip_gt_only_set for name in gt_names):
+                skipped_gt_only += 1
+                continue
         if args.skip_empty and not anns:
             skipped += 1
             continue
@@ -336,7 +388,7 @@ def main() -> None:
                     draw=draw_gt,
                     box=(x1, y1, x2, y2),
                     label=cat_name,
-                    color=color_for_category(cat_id),
+                    color=color_for_class_name(cat_name, category_id=cat_id),
                     line_width=args.line_width,
                     font=font,
                 )
@@ -360,7 +412,7 @@ def main() -> None:
                     draw=draw_pred,
                     box=(x1, y1, x2, y2),
                     label=label,
-                    color=color_for_category(color_id),
+                    color=color_for_class_name(name, category_id=color_id),
                     line_width=args.line_width,
                     font=font,
                 )
@@ -370,7 +422,8 @@ def main() -> None:
 
     print(
         f"Done. split={args.split} mode={args.mode} "
-        f"saved_gt={saved_gt} saved_pred={saved_pred} skipped={skipped} output_dir={output_dir}"
+        f"saved_gt={saved_gt} saved_pred={saved_pred} "
+        f"skipped={skipped} skipped_gt_only={skipped_gt_only} output_dir={output_dir}"
     )
 
 

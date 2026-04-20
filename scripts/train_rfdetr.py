@@ -335,38 +335,55 @@ def prepare_dataset_for_class_selection(
 
 def build_requested_aug_config() -> Dict[str, Any]:
     """
-    Requested policy:
+    Strong color/illumination policy for robust defect detection:
     - HorizontalFlip p=0.2
-    - RGBShift p=0.2 OR HSV(HueSaturationValue) p=0.2 OR ChannelShuffle p=0.2
+    - OneOf(color/brightness transforms) with weighted selection
 
-    Implementation detail:
-    - RF-DETR docs state OneOf container always fires, and child `p` is used as
-      selection weight.
-    - We add NoOp with weight 0.4, so each color transform is selected with
-      exact relative probability 0.2, and 0.4 means no color transform.
+    Note:
+    - RF-DETR aug_config uses Albumentations-like config where OneOf always fires.
+    - Child `p` values inside OneOf are treated as selection weights.
+    - NoOp is kept to avoid over-augmentation on every sample.
     """
     return {
         "HorizontalFlip": {"p": 0.2},
         "OneOf": {
             "transforms": [
                 {
-                    "RGBShift": {
-                        "r_shift_limit": 20,
-                        "g_shift_limit": 20,
-                        "b_shift_limit": 20,
-                        "p": 0.2,
+                    "RandomBrightnessContrast": {
+                        "brightness_limit": 0.35,
+                        "contrast_limit": 0.35,
+                        "p": 0.22,
+                    }
+                },
+                {
+                    "ColorJitter": {
+                        "brightness": 0.35,
+                        "contrast": 0.35,
+                        "saturation": 0.30,
+                        "hue": 0.06,
+                        "p": 0.20,
                     }
                 },
                 {
                     "HueSaturationValue": {
-                        "hue_shift_limit": 10,
-                        "sat_shift_limit": 20,
-                        "val_shift_limit": 20,
-                        "p": 0.2,
+                        "hue_shift_limit": 15,
+                        "sat_shift_limit": 35,
+                        "val_shift_limit": 35,
+                        "p": 0.18,
                     }
                 },
-                {"ChannelShuffle": {"p": 0.2}},
-                {"NoOp": {"p": 0.4}},
+                {
+                    "RGBShift": {
+                        "r_shift_limit": 30,
+                        "g_shift_limit": 30,
+                        "b_shift_limit": 30,
+                        "p": 0.15,
+                    }
+                },
+                {"RandomGamma": {"gamma_limit": [70, 140], "p": 0.12}},
+                {"CLAHE": {"clip_limit": [1, 4], "tile_grid_size": [8, 8], "p": 0.08}},
+                {"ChannelShuffle": {"p": 0.05}},
+                {"NoOp": {"p": 0.15}},
             ],
         },
     }

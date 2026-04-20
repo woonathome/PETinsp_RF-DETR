@@ -35,9 +35,10 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Rebuild preprocessing pipeline:\n"
             "1) filename-rule relabel to unknown,\n"
-            "2) pockmark top-contrast keep (top 20%), others -> unknown,\n"
-            "3) save secondary YOLO dataset,\n"
-            "4) resize 2048 + 8x8 tiling + train/valid/test split."
+            "2) size-filter air/gas/color (min side px), others -> unknown,\n"
+            "3) pockmark top-contrast keep (default top 50%), others -> unknown,\n"
+            "4) save secondary YOLO dataset,\n"
+            "5) resize 2048 + 8x8 tiling + train/valid/test split."
         )
     )
     p.add_argument("--source-root", type=Path, default=Path("Dataset-v3.v1i.yolov5pytorch"))
@@ -52,10 +53,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-ratio", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--min-box-area", type=float, default=1.0)
+    p.add_argument(
+        "--min-defect-side-px",
+        type=float,
+        default=10.0,
+        help=(
+            "For air/gas/color-distribution classes, keep bbox only when "
+            "width>=this or height>=this (in resized pixel coordinates). "
+            "Otherwise relabel to unknown."
+        ),
+    )
     p.add_argument("--split-strategy", choices=["dominant_class", "random"], default="dominant_class")
     p.add_argument("--max-images", type=int, default=None)
     p.add_argument("--keep-empty-tiles", action="store_true")
-    p.add_argument("--pockmark-top-percent", type=float, default=0.20)
+    p.add_argument("--pockmark-top-percent", type=float, default=0.50)
     p.add_argument("--pockmark-border-px", type=int, default=2)
     p.add_argument("--color-keyword", type=str, default="colordistribution")
     p.add_argument("--gas-keyword", type=str, default="gas")
@@ -75,6 +86,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--pockmark-top-percent must be in (0, 1].")
     if args.pockmark_border_px < 1:
         raise ValueError("--pockmark-border-px must be >= 1.")
+    if args.min_defect_side_px <= 0:
+        raise ValueError("--min-defect-side-px must be > 0.")
 
 
 def parse_yolo_file(path: Path) -> List[Tuple[int, float, float, float, float]]:
@@ -318,10 +331,41 @@ def main() -> None:
             out.append((new_cls, cx, cy, w, h))
         stage2_rows_by_index[s.index] = out
 
-    # Step-3: pockmark top 20% keep, others to unknown.
+    # Step-2.5: small air/gas/color-distribution boxes -> unknown.
+    stage25_rows_by_index: Dict[int, List[Tuple[int, float, float, float, float]]] = {}
+    size_filter_counter = Counter()
+    min_side_px = float(args.min_defect_side_px)
+    size_filter_target_ids = {air_id, gas_id, color_id}
+
+    for s in tqdm(samples, desc="Applying size filter (air/gas/color)"):
+        rows = stage2_rows_by_index[s.index]
+        boxes = yolo_to_xyxy_resized(rows, args.resize_size, args.resize_size)
+        by_row_idx = {row_idx: (cls, x2 - x1, y2 - y1) for row_idx, cls, x1, y1, x2, y2 in boxes}
+
+        out_rows = []
+        for row_idx, (cls, cx, cy, w, h) in enumerate(rows):
+            new_cls = cls
+            if cls in size_filter_target_ids:
+                bw = 0.0
+                bh = 0.0
+                if row_idx in by_row_idx:
+                    _, bw, bh = by_row_idx[row_idx]
+                keep = (bw >= min_side_px) or (bh >= min_side_px)
+                if not keep:
+                    if cls == air_id:
+                        size_filter_counter["airbubble_small_to_unknown"] += 1
+                    elif cls == gas_id:
+                        size_filter_counter["gasbubble_small_to_unknown"] += 1
+                    elif cls == color_id:
+                        size_filter_counter["color_distribution_small_to_unknown"] += 1
+                    new_cls = unknown_id
+            out_rows.append((new_cls, cx, cy, w, h))
+        stage25_rows_by_index[s.index] = out_rows
+
+    # Step-3: pockmark top 50% keep, others to unknown.
     scored = []
     for s in tqdm(samples, desc="Scoring pockmark contrast"):
-        rows = stage2_rows_by_index[s.index]
+        rows = stage25_rows_by_index[s.index]
         boxes = yolo_to_xyxy_resized(rows, args.resize_size, args.resize_size)
         pock_boxes = [b for b in boxes if b[1] == pockmark_id]
         if not pock_boxes:
@@ -350,7 +394,7 @@ def main() -> None:
     final_rows_by_index: Dict[int, List[Tuple[int, float, float, float, float]]] = {}
     for s in samples:
         rows = []
-        for row_idx, (cls, cx, cy, w, h) in enumerate(stage2_rows_by_index[s.index]):
+        for row_idx, (cls, cx, cy, w, h) in enumerate(stage25_rows_by_index[s.index]):
             if cls == pockmark_id and (s.index, row_idx) not in keep_keys:
                 rows.append((unknown_id, cx, cy, w, h))
             else:
@@ -436,11 +480,12 @@ def main() -> None:
         "output_root": str(output_root),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "class_ids": {"airbubble": air_id, "gasbubble": gas_id, "color_distribution": color_id, "pockmark": pockmark_id, "unknown": unknown_id},
-        "settings": {"pockmark_top_percent": args.pockmark_top_percent, "pockmark_border_px": args.pockmark_border_px, "air_keyword": args.air_keyword, "gas_keyword": args.gas_keyword, "color_keyword": args.color_keyword, "val_ratio": args.val_ratio, "test_ratio": args.test_ratio, "split_strategy": args.split_strategy},
+        "settings": {"pockmark_top_percent": args.pockmark_top_percent, "pockmark_border_px": args.pockmark_border_px, "min_defect_side_px": args.min_defect_side_px, "air_keyword": args.air_keyword, "gas_keyword": args.gas_keyword, "color_keyword": args.color_keyword, "val_ratio": args.val_ratio, "test_ratio": args.test_ratio, "split_strategy": args.split_strategy},
         "totals": {
             "source_images_with_labels": len(samples),
             "source_images_missing_labels": len(missing_labels),
             "step2_filename_rule_counts": dict(step2_counter),
+            "step2_5_size_filter_counts": dict(size_filter_counter),
             "step3_pockmark_filter": pock_stats,
             "split_source_images": {s: split_stats[s]["source_images"] for s in SPLITS},
             "split_saved_tiles": {s: split_stats[s]["saved_tiles"] for s in SPLITS},
@@ -468,6 +513,12 @@ def main() -> None:
         f"air={step2_counter['airbubble_to_unknown']}, "
         f"gas={step2_counter['gasbubble_to_unknown']}, "
         f"color={step2_counter['color_distribution_to_unknown']}"
+    )
+    print(
+        "Size filter relabel counts (air/gas/color): "
+        f"air={size_filter_counter['airbubble_small_to_unknown']}, "
+        f"gas={size_filter_counter['gasbubble_small_to_unknown']}, "
+        f"color={size_filter_counter['color_distribution_small_to_unknown']}"
     )
     print(
         "Pockmark filter: "
