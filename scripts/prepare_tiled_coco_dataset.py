@@ -35,8 +35,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Rebuild preprocessing pipeline:\n"
             "1) filename-rule relabel to unknown,\n"
-            "2) size-filter air/gas/color (min side px), others -> unknown,\n"
-            "3) pockmark top-contrast keep (default top 50%), others -> unknown,\n"
+            "2) size-filter air/gas/color with class-specific min side px, others -> unknown,\n"
+            "3) pockmark/blackspot top-contrast keep, others -> unknown,\n"
             "4) save secondary YOLO dataset,\n"
             "5) resize 2048 + 8x8 tiling + train/valid/test split."
         )
@@ -53,20 +53,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--test-ratio", type=float, default=0.10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--min-box-area", type=float, default=1.0)
-    p.add_argument(
-        "--min-defect-side-px",
-        type=float,
-        default=10.0,
-        help=(
-            "For air/gas/color-distribution classes, keep bbox only when "
-            "width>=this or height>=this (in resized pixel coordinates). "
-            "Otherwise relabel to unknown."
-        ),
-    )
+    p.add_argument("--min-air-side-px", type=float, default=10.0)
+    p.add_argument("--min-gas-side-px", type=float, default=20.0)
+    p.add_argument("--min-color-side-px", type=float, default=40.0)
     p.add_argument("--split-strategy", choices=["dominant_class", "random"], default="dominant_class")
     p.add_argument("--max-images", type=int, default=None)
     p.add_argument("--keep-empty-tiles", action="store_true")
     p.add_argument("--pockmark-top-percent", type=float, default=0.50)
+    p.add_argument("--blackspot-top-percent", type=float, default=0.20)
     p.add_argument("--pockmark-border-px", type=int, default=2)
     p.add_argument("--color-keyword", type=str, default="colordistribution")
     p.add_argument("--gas-keyword", type=str, default="gas")
@@ -84,10 +78,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--val-ratio + --test-ratio must be < 1.")
     if not (0.0 < args.pockmark_top_percent <= 1.0):
         raise ValueError("--pockmark-top-percent must be in (0, 1].")
+    if not (0.0 < args.blackspot_top_percent <= 1.0):
+        raise ValueError("--blackspot-top-percent must be in (0, 1].")
     if args.pockmark_border_px < 1:
         raise ValueError("--pockmark-border-px must be >= 1.")
-    if args.min_defect_side_px <= 0:
-        raise ValueError("--min-defect-side-px must be > 0.")
+    if args.min_air_side_px <= 0:
+        raise ValueError("--min-air-side-px must be > 0.")
+    if args.min_gas_side_px <= 0:
+        raise ValueError("--min-gas-side-px must be > 0.")
+    if args.min_color_side_px <= 0:
+        raise ValueError("--min-color-side-px must be > 0.")
 
 
 def parse_yolo_file(path: Path) -> List[Tuple[int, float, float, float, float]]:
@@ -304,6 +304,7 @@ def main() -> None:
     names = load_names_from_data_yaml(source_root)
     unknown_id = resolve_class_id(names, ["unknown"], 7)
     pockmark_id = resolve_class_id(names, ["pockmark"], 5)
+    blackspot_id = resolve_class_id(names, ["blackspot", "black_spot"], 1)
     air_id = resolve_class_id(names, ["airbubble", "air_bubble", "air"], 0)
     gas_id = resolve_class_id(names, ["gasbubble", "gas_bubble", "gas"], 4)
     color_id = resolve_class_id(names, ["color-distribution", "color_distribution", "colordistribution"], 2)
@@ -334,8 +335,12 @@ def main() -> None:
     # Step-2.5: small air/gas/color-distribution boxes -> unknown.
     stage25_rows_by_index: Dict[int, List[Tuple[int, float, float, float, float]]] = {}
     size_filter_counter = Counter()
-    min_side_px = float(args.min_defect_side_px)
-    size_filter_target_ids = {air_id, gas_id, color_id}
+    min_side_px_by_cls = {
+        air_id: float(args.min_air_side_px),
+        gas_id: float(args.min_gas_side_px),
+        color_id: float(args.min_color_side_px),
+    }
+    size_filter_target_ids = set(min_side_px_by_cls.keys())
 
     for s in tqdm(samples, desc="Applying size filter (air/gas/color)"):
         rows = stage2_rows_by_index[s.index]
@@ -350,6 +355,7 @@ def main() -> None:
                 bh = 0.0
                 if row_idx in by_row_idx:
                     _, bw, bh = by_row_idx[row_idx]
+                min_side_px = min_side_px_by_cls[cls]
                 keep = (bw >= min_side_px) or (bh >= min_side_px)
                 if not keep:
                     if cls == air_id:
@@ -362,40 +368,61 @@ def main() -> None:
             out_rows.append((new_cls, cx, cy, w, h))
         stage25_rows_by_index[s.index] = out_rows
 
-    # Step-3: pockmark top 50% keep, others to unknown.
-    scored = []
-    for s in tqdm(samples, desc="Scoring pockmark contrast"):
+    # Step-3: pockmark/blackspot contrast filter by top-percent per class.
+    contrast_targets = {
+        pockmark_id: {"name": "pockmark", "top_percent": float(args.pockmark_top_percent)},
+        blackspot_id: {"name": "blackspot", "top_percent": float(args.blackspot_top_percent)},
+    }
+    scored_by_cls: Dict[int, List[Tuple[Tuple[int, int], float]]] = {
+        cls_id: [] for cls_id in contrast_targets.keys()
+    }
+
+    for s in tqdm(samples, desc="Scoring pockmark/blackspot contrast"):
         rows = stage25_rows_by_index[s.index]
         boxes = yolo_to_xyxy_resized(rows, args.resize_size, args.resize_size)
-        pock_boxes = [b for b in boxes if b[1] == pockmark_id]
-        if not pock_boxes:
+        target_boxes = [b for b in boxes if b[1] in contrast_targets]
+        if not target_boxes:
             continue
         with Image.open(s.image_path) as img:
             im = img.convert("RGB")
         if im.size != (args.resize_size, args.resize_size):
             im = im.resize((args.resize_size, args.resize_size), Image.Resampling.BILINEAR)
         gray = np.asarray(im, dtype=np.float32).mean(axis=2)
-        for row_idx, _, x1, y1, x2, y2 in pock_boxes:
-            scored.append(((s.index, row_idx), compute_box_contrast(gray, x1, y1, x2, y2, args.pockmark_border_px)))
+        for row_idx, cls_id, x1, y1, x2, y2 in target_boxes:
+            contrast = compute_box_contrast(gray, x1, y1, x2, y2, args.pockmark_border_px)
+            scored_by_cls[cls_id].append(((s.index, row_idx), contrast))
 
-    keep_keys = set()
-    pock_stats = {"total_pockmark_boxes": 0, "keep_count": 0, "to_unknown_count": 0, "contrast_threshold": 0.0}
-    if scored:
-        scored.sort(key=lambda x: x[1], reverse=True)
-        k = max(1, int(math.ceil(len(scored) * args.pockmark_top_percent)))
-        keep_keys = {key for key, _ in scored[:k]}
-        pock_stats = {
-            "total_pockmark_boxes": len(scored),
-            "keep_count": k,
-            "to_unknown_count": len(scored) - k,
-            "contrast_threshold": float(scored[k - 1][1]),
+    keep_keys_by_cls: Dict[int, set] = {cls_id: set() for cls_id in contrast_targets.keys()}
+    contrast_stats: Dict[str, Dict[str, float | int]] = {}
+    for cls_id, target_info in contrast_targets.items():
+        cls_name = str(target_info["name"])
+        top_percent = float(target_info["top_percent"])
+        scored = scored_by_cls[cls_id]
+        stats = {
+            "total_boxes": 0,
+            "keep_count": 0,
+            "to_unknown_count": 0,
+            "contrast_threshold": 0.0,
+            "top_percent": top_percent,
         }
+        if scored:
+            scored.sort(key=lambda x: x[1], reverse=True)
+            k = max(1, int(math.ceil(len(scored) * top_percent)))
+            keep_keys_by_cls[cls_id] = {key for key, _ in scored[:k]}
+            stats = {
+                "total_boxes": len(scored),
+                "keep_count": k,
+                "to_unknown_count": len(scored) - k,
+                "contrast_threshold": float(scored[k - 1][1]),
+                "top_percent": top_percent,
+            }
+        contrast_stats[cls_name] = stats
 
     final_rows_by_index: Dict[int, List[Tuple[int, float, float, float, float]]] = {}
     for s in samples:
         rows = []
         for row_idx, (cls, cx, cy, w, h) in enumerate(stage25_rows_by_index[s.index]):
-            if cls == pockmark_id and (s.index, row_idx) not in keep_keys:
+            if cls in keep_keys_by_cls and (s.index, row_idx) not in keep_keys_by_cls[cls]:
                 rows.append((unknown_id, cx, cy, w, h))
             else:
                 rows.append((cls, cx, cy, w, h))
@@ -479,14 +506,16 @@ def main() -> None:
         "secondary_root": str(secondary_root),
         "output_root": str(output_root),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "class_ids": {"airbubble": air_id, "gasbubble": gas_id, "color_distribution": color_id, "pockmark": pockmark_id, "unknown": unknown_id},
-        "settings": {"pockmark_top_percent": args.pockmark_top_percent, "pockmark_border_px": args.pockmark_border_px, "min_defect_side_px": args.min_defect_side_px, "air_keyword": args.air_keyword, "gas_keyword": args.gas_keyword, "color_keyword": args.color_keyword, "val_ratio": args.val_ratio, "test_ratio": args.test_ratio, "split_strategy": args.split_strategy},
+        "class_ids": {"airbubble": air_id, "gasbubble": gas_id, "color_distribution": color_id, "blackspot": blackspot_id, "pockmark": pockmark_id, "unknown": unknown_id},
+        "settings": {"pockmark_top_percent": args.pockmark_top_percent, "blackspot_top_percent": args.blackspot_top_percent, "pockmark_border_px": args.pockmark_border_px, "min_air_side_px": args.min_air_side_px, "min_gas_side_px": args.min_gas_side_px, "min_color_side_px": args.min_color_side_px, "air_keyword": args.air_keyword, "gas_keyword": args.gas_keyword, "color_keyword": args.color_keyword, "val_ratio": args.val_ratio, "test_ratio": args.test_ratio, "split_strategy": args.split_strategy},
         "totals": {
             "source_images_with_labels": len(samples),
             "source_images_missing_labels": len(missing_labels),
             "step2_filename_rule_counts": dict(step2_counter),
             "step2_5_size_filter_counts": dict(size_filter_counter),
-            "step3_pockmark_filter": pock_stats,
+            "step3_contrast_filters": contrast_stats,
+            "step3_pockmark_filter": contrast_stats.get("pockmark", {}),
+            "step3_blackspot_filter": contrast_stats.get("blackspot", {}),
             "split_source_images": {s: split_stats[s]["source_images"] for s in SPLITS},
             "split_saved_tiles": {s: split_stats[s]["saved_tiles"] for s in SPLITS},
             "split_saved_annotations": {s: split_stats[s]["saved_annotations"] for s in SPLITS},
@@ -521,10 +550,24 @@ def main() -> None:
         f"color={size_filter_counter['color_distribution_small_to_unknown']}"
     )
     print(
-        "Pockmark filter: "
-        f"total={pock_stats['total_pockmark_boxes']}, "
-        f"keep={pock_stats['keep_count']}, "
-        f"to_unknown={pock_stats['to_unknown_count']}"
+        "Size filter thresholds (px, width OR height): "
+        f"air>={args.min_air_side_px}, "
+        f"gas>={args.min_gas_side_px}, "
+        f"color>={args.min_color_side_px}"
+    )
+    print(
+        "Contrast filter (pockmark): "
+        f"total={contrast_stats['pockmark']['total_boxes']}, "
+        f"keep={contrast_stats['pockmark']['keep_count']}, "
+        f"to_unknown={contrast_stats['pockmark']['to_unknown_count']}, "
+        f"top_percent={contrast_stats['pockmark']['top_percent']}"
+    )
+    print(
+        "Contrast filter (blackspot): "
+        f"total={contrast_stats['blackspot']['total_boxes']}, "
+        f"keep={contrast_stats['blackspot']['keep_count']}, "
+        f"to_unknown={contrast_stats['blackspot']['to_unknown_count']}, "
+        f"top_percent={contrast_stats['blackspot']['top_percent']}"
     )
     for split in SPLITS:
         print(

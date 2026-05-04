@@ -65,6 +65,15 @@ def parse_args() -> argparse.Namespace:
         help="Prediction confidence threshold.",
     )
     p.add_argument(
+        "--class-threshold-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to pr_curves_<split>.json for class-wise best thresholds. "
+            "If omitted, auto-searches common runs/pr_auc_eval paths."
+        ),
+    )
+    p.add_argument(
         "--iou-threshold",
         type=float,
         default=0.5,
@@ -112,6 +121,126 @@ def parse_class_tokens(raw_values: List[str] | None) -> set[str]:
             if name:
                 out.add(name)
     return out
+
+
+def _normalize_class_key(name: Any) -> str:
+    return str(name).strip().lower()
+
+
+def _parse_threshold_value(value: Any) -> float | None:
+    try:
+        thr = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(thr):
+        return None
+    if thr < 0.0 or thr > 1.0:
+        return None
+    return thr
+
+
+def find_pr_curve_json_path(
+    run_dir: Path,
+    split: str,
+    model_size: str,
+    preferred_json: Path | None = None,
+) -> Path | None:
+    run_dir = run_dir.resolve()
+    file_names = [f"pr_curves_{split}.json"]
+    if str(split).lower() != "test":
+        file_names.append("pr_curves_test.json")
+
+    candidate_subdirs = [run_dir.name, model_size]
+    if model_size == "medium":
+        candidate_subdirs.append("medium-v2")
+
+    raw_candidates: List[Path] = []
+    if preferred_json is not None:
+        raw_candidates.append(preferred_json)
+
+    for file_name in file_names:
+        raw_candidates.append(run_dir / file_name)
+        for subdir in candidate_subdirs:
+            raw_candidates.extend(
+                [
+                    run_dir.parent / "pr_auc_eval" / subdir / file_name,
+                    Path.cwd() / "runs" / "pr_auc_eval" / subdir / file_name,
+                    Path("runs") / "pr_auc_eval" / subdir / file_name,
+                ]
+            )
+
+    seen: set[str] = set()
+    for cand in raw_candidates:
+        resolved = cand.expanduser().resolve()
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists() and resolved.is_file():
+            return resolved
+    return None
+
+
+def load_classwise_best_thresholds(
+    run_dir: Path,
+    split: str,
+    model_size: str,
+    preferred_json: Path | None = None,
+) -> tuple[Dict[str, float], Path | None]:
+    json_path = find_pr_curve_json_path(
+        run_dir=run_dir,
+        split=split,
+        model_size=model_size,
+        preferred_json=preferred_json,
+    )
+    if json_path is None:
+        return {}, None
+
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Warning: failed to read PR-curve json: {json_path} ({exc})")
+        return {}, json_path
+
+    class_to_thr: Dict[str, float] = {}
+
+    summary = payload.get("summary", [])
+    if isinstance(summary, list):
+        for row in summary:
+            if not isinstance(row, dict):
+                continue
+            class_name = row.get("class_name", None)
+            if class_name is None:
+                continue
+            thr = _parse_threshold_value(row.get("best_threshold_by_f1", None))
+            if thr is None:
+                continue
+            class_to_thr[_normalize_class_key(class_name)] = float(thr)
+
+    curves = payload.get("curves", {})
+    if isinstance(curves, dict):
+        for class_name, curve in curves.items():
+            key = _normalize_class_key(class_name)
+            if key in class_to_thr:
+                continue
+            if not isinstance(curve, dict):
+                continue
+            thr = _parse_threshold_value(curve.get("best_threshold", None))
+            if thr is None:
+                continue
+            class_to_thr[key] = float(thr)
+
+    return class_to_thr, json_path
+
+
+def threshold_for_class(
+    class_name: str,
+    default_threshold: float,
+    classwise_thresholds: Dict[str, float] | None,
+) -> float:
+    if not classwise_thresholds:
+        return float(default_threshold)
+    return float(classwise_thresholds.get(_normalize_class_key(class_name), float(default_threshold)))
 
 
 def resolve_model_checkpoint(args: argparse.Namespace) -> Path:
@@ -352,6 +481,32 @@ def main() -> None:
         pred_class_names = eval_class_names
         print(f"Using class order from dataset categories: {pred_class_names}")
 
+    classwise_thresholds, class_threshold_json_used = load_classwise_best_thresholds(
+        run_dir=args.run_dir.resolve(),
+        split=args.split,
+        model_size=args.model_size,
+        preferred_json=args.class_threshold_json,
+    )
+    if class_threshold_json_used is not None and classwise_thresholds:
+        covered = sorted(
+            [name for name in pred_class_names if name.strip().lower() in classwise_thresholds]
+        )
+        print(f"Using class-wise thresholds from: {class_threshold_json_used}")
+        print(f"Class-wise threshold coverage: {len(covered)}/{len(pred_class_names)}")
+        threshold_mode = "classwise_best_f1"
+    elif class_threshold_json_used is not None:
+        print(
+            "PR-curve json was found, but no usable class thresholds were parsed: "
+            f"{class_threshold_json_used}"
+        )
+        threshold_mode = "global"
+    else:
+        print(
+            "Class-wise threshold json not found. "
+            f"Falling back to global threshold={float(args.threshold):.4f}"
+        )
+        threshold_mode = "global"
+
     num_classes = len(eval_class_names)
     bg_idx = num_classes
     labels = eval_class_names + ["background"]
@@ -396,11 +551,24 @@ def main() -> None:
                 skipped_gt_only += 1
                 continue
 
-        pred_rows = extract_predictions(predictor.predict(pil_img, threshold=args.threshold))
+        infer_threshold = min(float(args.threshold), 0.001) if classwise_thresholds else float(args.threshold)
+        raw_pred_rows = extract_predictions(predictor.predict(pil_img, threshold=infer_threshold))
+        pred_rows = []
+        for cid, conf, x1, y1, x2, y2 in raw_pred_rows:
+            if 0 <= cid < len(pred_class_names):
+                cname = pred_class_names[cid]
+                thr = threshold_for_class(
+                    class_name=cname,
+                    default_threshold=float(args.threshold),
+                    classwise_thresholds=classwise_thresholds,
+                )
+            else:
+                thr = float(args.threshold)
+            if float(conf) >= float(thr):
+                pred_rows.append((cid, conf, x1, y1, x2, y2))
         pred_boxes: List[List[float]] = []
         pred_cls: List[int] = []
         for cid, conf, x1, y1, x2, y2 in pred_rows:
-            _ = conf
             if not (0 <= cid < len(pred_class_names)):
                 skipped_unmapped_pred += 1
                 continue
@@ -439,11 +607,16 @@ def main() -> None:
 
     save_matrix_csv(raw_csv, cm, labels)
     save_matrix_csv(matched_csv, matched_only, eval_class_names)
+    title_threshold = (
+        "classwise(best-F1)"
+        if threshold_mode == "classwise_best_f1"
+        else f"global>={float(args.threshold):.3f}"
+    )
     plot_heatmap(
         raw_png,
         cm,
         labels,
-        title=f"RF-DETR Confusion Matrix ({args.split}, IoU>={args.iou_threshold}, thr>={args.threshold})",
+        title=f"RF-DETR Confusion Matrix ({args.split}, IoU>={args.iou_threshold}, {title_threshold})",
         normalize=False,
     )
     plot_heatmap(
@@ -468,6 +641,13 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "model_size": args.model_size,
         "threshold": float(args.threshold),
+        "threshold_mode": threshold_mode,
+        "classwise_threshold_json": str(class_threshold_json_used)
+        if class_threshold_json_used is not None
+        else None,
+        "classwise_threshold_coverage": int(
+            sum(1 for n in pred_class_names if n.strip().lower() in classwise_thresholds)
+        ),
         "iou_threshold": float(args.iou_threshold),
         "processed_images": int(processed_images),
         "requested_images": int(limit),
@@ -492,6 +672,13 @@ def main() -> None:
     print(f"  matched_only_csv: {matched_csv}")
     print(f"  matched_only_png: {matched_png}")
     print(f"  summary_json: {summary_json}")
+    if threshold_mode == "classwise_best_f1":
+        print(
+            f"  threshold_mode: {threshold_mode} "
+            f"(json={class_threshold_json_used})"
+        )
+    else:
+        print(f"  threshold_mode: {threshold_mode} (global={float(args.threshold):.4f})")
     print(
         f"Processed images={processed_images}/{limit}, "
         f"missing_images={skipped_missing_image}, "

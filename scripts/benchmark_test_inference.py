@@ -23,7 +23,7 @@ MODEL_CLASS_BY_SIZE = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Report RF-DETR parameter count and avg inference time per tile on a COCO split."
+        description="Report RF-DETR parameter count and avg inference time per tile on COCO test split."
     )
     p.add_argument(
         "--dataset-dir",
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         "--split",
         choices=["train", "valid", "test"],
         default="test",
-        help="Which split to benchmark.",
+        help="Split to benchmark. This script is intended for test split.",
     )
     p.add_argument(
         "--run-dir",
@@ -311,6 +311,11 @@ def percentile(values: List[float], q: float) -> float:
 
 def main() -> None:
     args = parse_args()
+    if args.split != "test":
+        raise ValueError(
+            f"This benchmark is for test split only. Received --split {args.split!r}. "
+            "Use --split test."
+        )
     dataset_dir = args.dataset_dir.resolve()
     split_dir = dataset_dir / args.split
     ann_path = split_dir / "_annotations.coco.json"
@@ -318,6 +323,12 @@ def main() -> None:
         raise FileNotFoundError(f"Annotation file not found: {ann_path}")
 
     predictor, checkpoint_path = load_predictor(args)
+    torch_module = try_get_torch_module(predictor)
+    if torch_module is not None:
+        torch_module.eval()
+        print("Inference mode setup: torch module set to eval().")
+    else:
+        print("Inference mode setup: torch module handle not found (predictor wrapper only).")
     param_stats = count_parameters(predictor, checkpoint_path)
 
     payload = json.loads(ann_path.read_text(encoding="utf-8"))
@@ -348,7 +359,8 @@ def main() -> None:
         if use_cuda_sync:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
-        _ = predictor.predict(rgb, threshold=args.threshold)
+        with torch.inference_mode():
+            _ = predictor.predict(rgb, threshold=args.threshold)
         if use_cuda_sync:
             torch.cuda.synchronize()
         return time.perf_counter() - t0

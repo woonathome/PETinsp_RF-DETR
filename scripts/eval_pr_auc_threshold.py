@@ -273,6 +273,7 @@ def compute_pr_for_class(
         return {
             "num_gt": 0,
             "num_pred": len(pred_list),
+            "num_pred_at_best_threshold": 0,
             "thresholds": [],
             "precision": [],
             "recall": [],
@@ -332,15 +333,18 @@ def compute_pr_for_class(
         best_f1 = float(f1[best_idx])
         best_precision = float(precision[best_idx])
         best_recall = float(recall[best_idx])
+        num_pred_at_best_threshold = int(sum(1 for _, score, _ in preds if float(score) >= best_threshold))
     else:
         best_threshold = None
         best_f1 = 0.0
         best_precision = 0.0
         best_recall = 0.0
+        num_pred_at_best_threshold = 0
 
     return {
         "num_gt": int(n_gt),
         "num_pred": int(len(preds)),
+        "num_pred_at_best_threshold": int(num_pred_at_best_threshold),
         "thresholds": thresholds.tolist(),
         "precision": precision.tolist(),
         "recall": recall.tolist(),
@@ -481,6 +485,7 @@ def main() -> None:
                 "class_name": cname,
                 "num_gt": curve["num_gt"],
                 "num_pred": curve["num_pred"],
+                "num_pred_at_best_threshold": curve["num_pred_at_best_threshold"],
                 "pr_auc": curve["ap_auc"],
                 "best_threshold_by_f1": curve["best_threshold"],
                 "best_f1": curve["best_f1"],
@@ -503,6 +508,7 @@ def main() -> None:
                 "class_name",
                 "num_gt",
                 "num_pred",
+                "num_pred_at_best_threshold",
                 "pr_auc",
                 "best_threshold_by_f1",
                 "best_f1",

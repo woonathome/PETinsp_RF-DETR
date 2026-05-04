@@ -66,7 +66,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-best",
         action="store_true",
-        help="Resume from output_dir/checkpoint_best_total.pth if it exists.",
+        help=(
+            "Resume from best checkpoint in output_dir. "
+            "Prefers checkpoint_best_class_mean.* when available."
+        ),
     )
     parser.add_argument(
         "--resume-from",
@@ -105,6 +108,25 @@ def parse_args() -> argparse.Namespace:
         "--force-high-level-api",
         action="store_true",
         help="Force model.train(...) path instead of PTL custom API.",
+    )
+    parser.add_argument(
+        "--save-best-metric",
+        choices=["class_mean", "total"],
+        default="class_mean",
+        help=(
+            "Best-checkpoint criterion. "
+            "'class_mean' uses per-class validation AP average (macro), "
+            "'total' keeps default aggregate metric behavior."
+        ),
+    )
+    parser.add_argument(
+        "--best-class-mean-exclude-classes",
+        nargs="+",
+        default=["unknown"],
+        help=(
+            "Class names excluded when save-best-metric=class_mean. "
+            "Supports space/comma-separated values."
+        ),
     )
     parser.add_argument(
         "--include-classes",
@@ -183,6 +205,10 @@ def parse_class_tokens(raw_values: List[str] | None) -> List[str]:
             seen.add(key)
             out.append(name)
     return out
+
+
+def normalize_metric_key(text: str) -> str:
+    return "".join(ch for ch in str(text).lower() if ch.isalnum())
 
 
 def resolve_selected_class_names(
@@ -403,17 +429,22 @@ def resolve_resume_path(
         return str(resolved)
 
     if resume_best:
-        best_total = output_dir / "checkpoint_best_total.pth"
-        if best_total.exists():
-            chosen = best_total.resolve()
-            print(f"Resume checkpoint selected (--resume-best): {chosen}")
-            return str(chosen)
+        preferred_best = [
+            output_dir / "checkpoint_best_class_mean.ckpt",
+            output_dir / "checkpoint_best_class_mean.pth",
+            output_dir / "checkpoint_best_total.pth",
+        ]
+        for p in preferred_best:
+            if p.exists():
+                chosen = p.resolve()
+                print(f"Resume checkpoint selected (--resume-best): {chosen}")
+                return str(chosen)
 
         best_candidates = sorted(
             [
                 p
-                for p in output_dir.glob("checkpoint_best*.pth")
-                if p.is_file()
+                for p in output_dir.glob("checkpoint_best*")
+                if p.is_file() and p.suffix.lower() in {".ckpt", ".pth"}
             ],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
@@ -467,6 +498,12 @@ def run_high_level_train(
     aug_config: Dict[str, Any] | None,
     class_count: int,
 ) -> None:
+    if args.save_best_metric == "class_mean":
+        print(
+            "Warning: save-best-metric=class_mean is only fully supported in custom PTL API mode. "
+            "High-level model.train() keeps RF-DETR default best-checkpoint logic."
+        )
+
     class_name = MODEL_CLASS_BY_SIZE[args.model_size]
     model_cls = getattr(rfdetr, class_name, None)
     if model_cls is None:
@@ -715,6 +752,8 @@ def main() -> None:
             if k in train_config_sig.parameters
         }
     train_config = TrainConfig(**train_config_kwargs)
+    best_class_mean_exclude_tokens = parse_class_tokens(args.best_class_mean_exclude_classes)
+    best_class_mean_exclude_set = {x.lower() for x in best_class_mean_exclude_tokens}
 
     # Callback imports: support both old/new lightning package names.
     try:
@@ -788,6 +827,145 @@ def main() -> None:
             else:
                 print(f"[EpochMetrics] epoch={epoch:03d} | no validation metrics found")
 
+    class ClassMeanBestCheckpointSaver(Callback):
+        """
+        Save best checkpoint by class-wise macro AP over validation metrics.
+        """
+
+        def __init__(
+            self,
+            output_dir: Path,
+            class_names: List[str],
+            excluded_class_names: List[str],
+        ) -> None:
+            super().__init__()
+            self.output_dir = Path(output_dir)
+            self.class_names = list(class_names)
+            self.excluded = {c.lower() for c in excluded_class_names}
+            self.best_score = -float("inf")
+            self.best_epoch = -1
+            self.best_ckpt_path = self.output_dir / "checkpoint_best_class_mean.ckpt"
+            self.best_pth_path = self.output_dir / "checkpoint_best_class_mean.pth"
+            self._warned_no_class_metrics = False
+
+        @staticmethod
+        def _to_float(v: Any) -> float | None:
+            if v is None:
+                return None
+            if isinstance(v, torch.Tensor):
+                if v.numel() != 1:
+                    return None
+                return float(v.detach().cpu().item())
+            if isinstance(v, (float, int)):
+                return float(v)
+            return None
+
+        def _pick_metric_for_class(self, metrics: Dict[str, Any], class_name: str) -> tuple[str, float] | None:
+            target = normalize_metric_key(class_name)
+            best_item: tuple[int, str, float] | None = None
+            for key, value in metrics.items():
+                fv = self._to_float(value)
+                if fv is None:
+                    continue
+                key_str = str(key)
+                norm_key = normalize_metric_key(key_str)
+                if target not in norm_key:
+                    continue
+                if "val" not in norm_key:
+                    continue
+                if any(t in norm_key for t in ("loss", "precision", "recall", "f1", "lr")):
+                    continue
+                if ("ap" not in norm_key) and ("map" not in norm_key):
+                    continue
+
+                score = 0
+                if ("ap5095" in norm_key) or ("map5095" in norm_key) or (("ap50" in norm_key) and ("95" in norm_key)):
+                    score += 100
+                elif ("ap50" in norm_key) or ("map50" in norm_key):
+                    score += 60
+                elif ("ap" in norm_key) or ("map" in norm_key):
+                    score += 40
+                else:
+                    continue
+
+                if "ema" not in norm_key:
+                    score += 5
+
+                if best_item is None or score > best_item[0]:
+                    best_item = (score, key_str, fv)
+
+            if best_item is None:
+                return None
+            return best_item[1], best_item[2]
+
+        def on_validation_epoch_end(self, trainer, pl_module) -> None:
+            if getattr(trainer, "sanity_checking", False):
+                return
+            metrics = trainer.callback_metrics
+            class_values = []
+            used_class_metrics = {}
+
+            for class_name in self.class_names:
+                if class_name.lower() in self.excluded:
+                    continue
+                picked = self._pick_metric_for_class(metrics, class_name)
+                if picked is None:
+                    continue
+                metric_key, metric_val = picked
+                class_values.append(metric_val)
+                used_class_metrics[class_name] = {
+                    "metric_key": metric_key,
+                    "value": metric_val,
+                }
+
+            if not class_values:
+                if not self._warned_no_class_metrics:
+                    print(
+                        "Warning: save-best-metric=class_mean is enabled but no per-class AP metrics were "
+                        "found in callback_metrics. Best-class-mean checkpoint will not be updated."
+                    )
+                    self._warned_no_class_metrics = True
+                return
+
+            class_mean = float(np.mean(class_values))
+            epoch = int(trainer.current_epoch) + 1
+            print(
+                f"[ClassMeanBest] epoch={epoch:03d} "
+                f"val/class_mean_AP={class_mean:.4f} "
+                f"(classes_used={len(class_values)})"
+            )
+            if class_mean <= self.best_score:
+                return
+
+            if getattr(trainer, "is_global_zero", True) is False:
+                return
+
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            trainer.save_checkpoint(str(self.best_ckpt_path), weights_only=False)
+            trainer.save_checkpoint(str(self.best_pth_path), weights_only=False)
+            self.best_score = class_mean
+            self.best_epoch = epoch
+            meta_path = self.output_dir / "best_class_mean_meta.json"
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "epoch": epoch,
+                        "val_class_mean_ap": class_mean,
+                        "excluded_classes": sorted(self.excluded),
+                        "used_class_metrics": used_class_metrics,
+                        "checkpoint_ckpt": str(self.best_ckpt_path),
+                        "checkpoint_pth": str(self.best_pth_path),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(
+                f"[Checkpoint] saved class-mean best: {self.best_ckpt_path} "
+                f"(score={class_mean:.4f})"
+            )
+
     class EpochAugmentationSeedCallback(Callback):
         """
         Ensures a different RNG seed per epoch so Albumentations random outcomes
@@ -811,13 +989,23 @@ def main() -> None:
     module = RFDETRModelModule(model_config, train_config)
     datamodule = RFDETRDataModule(model_config, train_config)
     trainer = build_trainer(train_config, model_config)
-    trainer.callbacks.extend(
+    extra_callbacks: List[Callback] = []
+    if args.save_best_metric == "class_mean":
+        extra_callbacks.append(
+            ClassMeanBestCheckpointSaver(
+                output_dir=output_dir,
+                class_names=class_names,
+                excluded_class_names=best_class_mean_exclude_tokens,
+            )
+        )
+    extra_callbacks.extend(
         [
             LastCheckpointSaver(output_dir=output_dir),
             EpochAugmentationSeedCallback(base_seed=args.seed),
             EpochMetricsPrinter(),
         ]
     )
+    trainer.callbacks.extend(extra_callbacks)
 
     print("Starting RF-DETR training (custom PTL API) with arguments:")
     print(f"  source_dataset_dir: {source_dataset_dir}")
@@ -835,6 +1023,9 @@ def main() -> None:
     print(f"  progress_bar: {None if args.no_progress_bar else 'tqdm'}")
     print(f"  seed(base): {args.seed}")
     print(f"  augmentation: {'disabled' if args.disable_augment else 'enabled'}")
+    print(f"  save_best_metric: {args.save_best_metric}")
+    if args.save_best_metric == "class_mean":
+        print(f"  class_mean_exclude_classes: {sorted(best_class_mean_exclude_set)}")
     print(f"  resume: {args.resume}")
     print(f"  resume_best: {args.resume_best}")
 
