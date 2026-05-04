@@ -1,4 +1,4 @@
-# RF-DETR Pipeline for PET inspection Pipeline
+﻿# RF-DETR Pipeline for PET inspection Pipeline
 
 This project builds a training dataset from:
 - `Dataset-v3.v1i.yolov5pytorch/train/images`
@@ -10,12 +10,13 @@ Workflow:
    - `color-distribution`, `gasbubble`, `airbubble` labels become `unknown` when filename does not contain `colordistribution`, `gas`, `air`
 3. Size filter for `airbubble / gasbubble / color-distribution`:
    - keep only when bbox width `>=10px` OR height `>=10px` (resized pixel coordinates), otherwise relabel to `unknown`
-4. For `pockmark`, compute contrast = `|mean(inner bbox) - mean(outer 2px ring)|`
-5. Keep top 50% pockmark boxes as `pockmark`, relabel remaining as `unknown`
-6. Save refined secondary YOLO dataset
-7. Tile to `8x8` (`256x256`)
-8. Create COCO splits (`train/valid/test`)
-9. Train RF-DETR
+4. For `pockmark` and `blackspot`, compute contrast = `|mean(inner bbox) - mean(outer 2px ring)|`
+5. Keep top 50% `pockmark` boxes, relabel remaining to `unknown`
+6. Keep top 20% `blackspot` boxes, relabel remaining to `unknown`
+7. Save refined secondary YOLO dataset
+8. Tile to `8x8` (`256x256`)
+9. Create COCO splits (`train/valid/test`)
+10. Train RF-DETR
 
 ## 1) Install
 
@@ -35,8 +36,11 @@ python scripts/prepare_tiled_coco_dataset.py
   --val-ratio 0.15 
   --test-ratio 0.10 
   --split-strategy dominant_class 
-  --min-defect-side-px 10 
-  --pockmark-top-percent 0.10 
+  --min-air-side-px 10 
+  --min-gas-side-px 20 
+  --min-color-side-px 40 
+  --pockmark-top-percent 0.50 
+  --blackspot-top-percent 0.20 
   --pockmark-border-px 2 
   --seed 42 
   --overwrite
@@ -45,9 +49,13 @@ python scripts/prepare_tiled_coco_dataset.py
 Notes:
 - `split-strategy=dominant_class` keeps split ratios per dominant-class stratum.
 - This is used to keep train/valid/test ratio behavior consistent across subgroups.
-- `air/gas/color-distribution` are size-filtered by `--min-defect-side-px` and small boxes are relabeled to `unknown`.
+- `air/gas/color-distribution` are size-filtered by class-specific thresholds and small boxes are relabeled to `unknown`:
+  - `--min-air-side-px` (default `10`)
+  - `--min-gas-side-px` (default `20`)
+  - `--min-color-side-px` (default `40`)
 - `pockmark` keeps only top contrast ratio by `--pockmark-top-percent` (default `0.50`).
-- Secondary refined YOLO dataset is saved at `--secondary-root` (workflow step-6 artifact).
+- `blackspot` keeps only top contrast ratio by `--blackspot-top-percent` (default `0.20`).
+- Secondary refined YOLO dataset is saved at `--secondary-root` (workflow step-7 artifact).
 
 ## 3) Train
 
@@ -61,6 +69,27 @@ python scripts/train_rfdetr.py
   --grad-accum-steps 2 
   --num-workers 8 
   --lr 1e-4 
+  --tensorboard
+```
+
+Best-checkpoint behavior (default):
+- `--save-best-metric class_mean`
+- best file: `checkpoint_best_class_mean.ckpt` (and `.pth`)
+- excluded from class-mean by default: `unknown` (`--best-class-mean-exclude-classes unknown`)
+
+Use old aggregate behavior if needed:
+
+```bash
+python scripts/train_rfdetr.py 
+  --dataset-dir ./data/rfdetr_tiled_coco 
+  --output-dir ./runs/rfdetr-medium 
+  --model-size medium 
+  --epochs 100 
+  --batch-size 8 
+  --grad-accum-steps 2 
+  --num-workers 8 
+  --lr 1e-4 
+  --save-best-metric total 
   --tensorboard
 ```
 
@@ -108,7 +137,7 @@ python scripts/train_rfdetr.py
   --tensorboard
 ```
 
-Resume from best total checkpoint:
+Resume from best checkpoint (`--resume-best` prefers `checkpoint_best_class_mean.*`):
 
 ```bash
 python scripts/train_rfdetr.py 
@@ -138,7 +167,7 @@ python scripts/train_rfdetr.py
   --num-workers 8 
   --lr 1e-4 
   --exclude-classes unknown 
-  --resume-from ./runs/rfdetr-medium/checkpoint_best_total.pth 
+  --resume-from ./runs/rfdetr-medium/checkpoint_best_class_mean.ckpt 
   --tensorboard
 ```
 
@@ -156,7 +185,8 @@ No class-index-base option is needed.
 
 ## 7) Split Visualization (Best Model)
 
-`checkpoint_best_total.pth` 기준으로 `train/valid/test` split을 각각 시각화:
+Use `checkpoint_best_total.pth` to visualize `train/valid/test` splits.
+Class-wise best thresholds (from PR-curve json) are auto-applied when found.
 
 ```bash
 # train split
@@ -202,12 +232,28 @@ python scripts/visualize_coco_bboxes.py
   --output-dir ./runs/vis/test_both_best
 ```
 
+Optional: force threshold json path explicitly:
+
+```bash
+python scripts/visualize_coco_bboxes.py 
+  --dataset-dir ./data/rfdetr_tiled_coco 
+  --split test 
+  --mode both 
+  --run-dir ./runs/rfdetr-medium 
+  --checkpoint ./runs/rfdetr-medium/checkpoint_best_total.pth 
+  --model-size medium 
+  --threshold 0.3 
+  --class-threshold-json ./runs/pr_auc_eval/medium/pr_curves_test.json 
+  --output-dir ./runs/vis/test_both_best
+```
+
 ## 8) Stage2 Refinement Before/After Compare
 
 For the specific stage2 refinement:
 - filename-rule relabel (`air/gas/color -> unknown`)
 - size filter (`air/gas/color`, min side px) then relabel small boxes to unknown
 - pockmark contrast top-50% keep (`pockmark -> unknown` for the rest)
+- blackspot contrast top-20% keep (`blackspot -> unknown` for the rest)
 
 compare **original YOLO vs `data/dataset_stage2_refined` YOLO**:
 
@@ -232,7 +278,8 @@ python scripts/compare_stage2_bbox_counts.py
 
 ## 9) Test Confusion Matrix (After Tiling)
 
-Generate confusion matrix on tiled COCO `test` split using best RF-DETR checkpoint:
+Generate confusion matrix on tiled COCO `test` split using best RF-DETR checkpoint.
+Class-wise best thresholds (from PR-curve json) are auto-applied when found:
 
 ```bash
 python scripts/eval_confusion_matrix.py 
@@ -248,11 +295,27 @@ python scripts/eval_confusion_matrix.py
   --output-dir ./runs/confusion/test_best
 ```
 
+Optional: force threshold json path explicitly:
+
+```bash
+python scripts/eval_confusion_matrix.py 
+  --dataset-dir ./data/rfdetr_tiled_coco 
+  --split test 
+  --run-dir ./runs/rfdetr-medium 
+  --checkpoint ./runs/rfdetr-medium/checkpoint_best_total.pth 
+  --model-size medium 
+  --threshold 0.5 
+  --class-threshold-json ./runs/pr_auc_eval/medium/pr_curves_test.json 
+  --iou-threshold 0.3 
+  --output-dir ./runs/confusion/test_best
+```
+
 Outputs:
 - raw confusion csv/png (with background row/col)
 - row-normalized confusion png
 - matched-only class confusion csv/png
 - summary json
+- summary includes `threshold_mode` (`classwise_best_f1` or `global`)
 
 ## 10) Class-wise PR Curve / PR-AUC / Best Threshold
 
@@ -295,3 +358,4 @@ Outputs (per model version under output dir):
 - `pr_auc_summary_<split>.csv`
 - `pr_curves_<split>.json`
 - `pr_curves_<split>.png`
+
